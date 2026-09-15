@@ -27,7 +27,7 @@ func (h *VisitorHandler) List(c *gin.Context) {
 		failVisitor(c, e)
 		return
 	}
-	OK(c, v)
+	OK(c, mapPasses(v))
 }
 
 // Create 业主登记访客凭证。
@@ -51,7 +51,7 @@ func (h *VisitorHandler) Create(c *gin.Context) {
 		failVisitor(c, err)
 		return
 	}
-	OK(c, v)
+	OK(c, mapPass(v))
 }
 
 // Detail 凭证详情及其生命周期留痕。
@@ -62,7 +62,7 @@ func (h *VisitorHandler) Detail(c *gin.Context) {
 		failVisitor(c, e)
 		return
 	}
-	OK(c, gin.H{"pass": v, "events": events})
+	OK(c, gin.H{"pass": mapPass(v), "events": mapEvents(events)})
 }
 
 // Cancel 业主取消本人凭证（物业亦可取消）。
@@ -73,7 +73,7 @@ func (h *VisitorHandler) Cancel(c *gin.Context) {
 		failVisitor(c, e)
 		return
 	}
-	OK(c, v)
+	OK(c, mapPass(v))
 }
 
 // Approve 物业审核通过。
@@ -90,7 +90,7 @@ func (h *VisitorHandler) Approve(c *gin.Context) {
 		failVisitor(c, e)
 		return
 	}
-	OK(c, v)
+	OK(c, mapPass(v))
 }
 
 // Reject 物业审核驳回。
@@ -105,5 +105,5 @@ func (h *VisitorHandler) Reject(c *gin.Context) {
 		failVisitor(c, e)
 		return
 	}
-	OK(c, v)
+	OK(c, mapPass(v))
 }

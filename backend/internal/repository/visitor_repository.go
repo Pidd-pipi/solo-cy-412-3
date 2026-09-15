@@ -79,10 +79,11 @@ func (r *VisitorPassRepository) ByPassNo(passNo string, tx *gorm.DB) (v model.Vi
 // 重叠判定：existing.start < end AND existing.end > start。
 func (r *VisitorPassRepository) FindOverlap(phone, building string, start, end time.Time, excludeID uint, tx *gorm.DB) (int64, error) {
 	var n int64
+	// 入库时刻统一为 UTC，比较参数也转 UTC，保证 SQLite 字符串时序比较与 MySQL 一致。
 	q := r.tx(tx).Model(&model.VisitorPass{}).
 		Where("visitor_phone = ? AND building = ?", phone, building).
 		Where("status IN ?", constants.ActivePassStatuses).
-		Where("start_time < ? AND end_time > ?", end, start)
+		Where("start_time < ? AND end_time > ?", end.UTC(), start.UTC())
 	if excludeID > 0 {
 		q = q.Where("id <> ?", excludeID)
 	}
@@ -114,7 +115,7 @@ func (r *VisitorPassRepository) CountOccupied(building string, tx *gorm.DB) (int
 func (r *VisitorPassRepository) ExpiredDue(now time.Time) (out []model.VisitorPass, e error) {
 	e = r.preload(r.DB).
 		Where("status IN ?", []string{constants.PassStatusApproved, constants.PassStatusCheckedIn}).
-		Where("end_time < ?", now).
+		Where("end_time < ?", now.UTC()).
 		Find(&out).Error
 	return
 }

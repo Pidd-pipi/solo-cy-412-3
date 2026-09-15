@@ -2,6 +2,7 @@
 -- visitor_passes        访客通行凭证：pass_no 唯一、状态机 pending/approved/checked_in/completed/cancelled/rejected/expired。
 -- visitor_events        取消、审核、进入、离开、逾期的全生命周期留痕（与状态变更同事务提交）。
 -- building_capacities   楼栋当日访客在场上限（在场数由 visitor_passes.status='checked_in' 实时统计，离开/逾期即恢复）。
+-- 时间约定：所有时间列以 UTC 绝对时刻存储（GORM BeforeSave 归一化），接口统一按社区时区（默认 Asia/Shanghai，APP_TIMEZONE 可配）渲染为 YYYY-MM-DD HH:mm 钟面串。
 -- 关键业务约束（应用层 + 事务保证）：
 --   1) 同一 visitor_phone + building 在有效状态(pending/approved/checked_in)下时段不得重叠；
 --   2) 审核与进入时校验在场数 < building_capacities.daily_limit，满则暂停（HTTP 409）；

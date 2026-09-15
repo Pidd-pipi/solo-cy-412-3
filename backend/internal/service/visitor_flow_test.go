@@ -1,11 +1,11 @@
 package service
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +14,7 @@ import (
 	"github.com/smartestate/smartestate/internal/constants"
 	"github.com/smartestate/smartestate/internal/model"
 	"github.com/smartestate/smartestate/internal/repository"
+	"github.com/smartestate/smartestate/internal/util"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -446,9 +447,9 @@ func TestFlow_RemainingEqualsApprovable(t *testing.T) {
 func TestFlow_BrowserLocalTimeConsistency(t *testing.T) {
 	env := newFlowEnv(t)
 	building := "时区一致栋"
-	// 模拟 datetime-local 提交的字符串（本地时区，T 分隔），经与生产相同的 ParseVisitTime 解析。
-	startStr := time.Now().Add(-30 * time.Minute).Format("2006-01-02T15:04")
-	endStr := time.Now().Add(2 * time.Hour).Format("2006-01-02T15:04")
+	// 模拟中文浏览器 datetime-local 提交的钟面串（无时区，T 分隔），按社区时区解释。
+	startStr := util.CommunityNow().Add(-30 * time.Minute).Format("2006-01-02T15:04")
+	endStr := util.CommunityNow().Add(2 * time.Hour).Format("2006-01-02T15:04")
 	start, err := ParseVisitTime(startStr)
 	if err != nil {
 		t.Fatalf("[登记阶段] 解析开始时间失败: %v", err)
@@ -459,7 +460,7 @@ func TestFlow_BrowserLocalTimeConsistency(t *testing.T) {
 	}
 	p := env.approveMust(env.register(building, env.uniquePhone(), start, end).ID)
 
-	// 列表与详情回读的时刻必须与提交时刻一致。
+	// 列表与详情回读的绝对时刻必须与提交一致。
 	list, err := env.svc.List(0, "staff", "", building)
 	if err != nil || len(list) != 1 || !list[0].StartTime.Equal(start) || !list[0].EndTime.Equal(end) {
 		t.Fatalf("[列表展示] 列表时段与提交时刻不一致: n=%d err=%v", len(list), err)
@@ -468,23 +469,26 @@ func TestFlow_BrowserLocalTimeConsistency(t *testing.T) {
 	if err != nil || !detail.StartTime.Equal(start) || !detail.EndTime.Equal(end) {
 		t.Fatalf("[详情展示] 详情时段与提交时刻不一致: %v", err)
 	}
+	// 渲染钟面必须等于业主提交的钟面（跨时区/跨部署都不偏移），业主/物业/门岗看到同一时刻。
+	wantWall := func(s string) string { return strings.Replace(s, "T", " ", 1) }
+	if got := util.FormatVisit(detail.StartTime); got != wantWall(startStr) {
+		t.Fatalf("[详情展示] 钟面偏移: 提交=%s 渲染=%s", wantWall(startStr), got)
+	}
 	if len(events) < 2 {
 		t.Fatalf("[留痕回读] 至少应有登记+审核两条，实际 %d", len(events))
 	}
-	// JSON 线路（浏览器真正收到的 RFC3339）反序列化后仍是同一绝对时刻。
-	raw, _ := json.Marshal(detail)
-	var wire model.VisitorPass
-	if err = json.Unmarshal(raw, &wire); err != nil || !wire.StartTime.Equal(start) {
-		t.Fatalf("[线路时序] JSON 往返后时刻不一致: %v start=%s wire=%s", err, start, wire.StartTime)
-	}
-	// 门岗核对基于同一存储时刻，当前在时段内应放行。
+	// 门岗核对基于同一存储时刻，当前在时段内应放行，且渲染钟面一致。
 	verify, info, err := env.svc.GateVerify(p.PassNo, env.staff.ID)
 	if err != nil || info["allow"] != true || !verify.StartTime.Equal(start) {
 		t.Fatalf("[门岗核对] 时段内应 allow=true 且时刻一致: allow=%v err=%v", info["allow"], err)
 	}
+	if util.FormatVisit(verify.StartTime) != wantWall(startStr) || util.FormatVisit(verify.EndTime) != wantWall(endStr) {
+		t.Fatalf("[门岗核对] 门岗看到的钟面与业主提交不一致")
+	}
 
 	// 未到时段的凭证：门岗必须拒绝且不改变状态（失败发生在进入阶段之前的核对环节）。
-	futureStart, futureEnd := windowFuture()
+	fs := util.CommunityNow().Add(2 * time.Hour)
+	futureStart, futureEnd := fs, fs.Add(2*time.Hour)
 	fp := env.approveMust(env.register(building, env.uniquePhone(), futureStart, futureEnd).ID)
 	if _, info, err = env.svc.GateVerify(fp.PassNo, env.staff.ID); err != nil || info["allow"] != false || info["reason"] != constants.MessageGateNotInWindow {
 		t.Fatalf("[门岗核对] 未到时段应 allow=false 且原因正确: info=%v err=%v", info, err)
@@ -501,19 +505,22 @@ func TestFlow_BrowserLocalTimeConsistency(t *testing.T) {
 func TestFlow_CrossDayOvernightWindow(t *testing.T) {
 	env := newFlowEnv(t)
 	building := "跨日时段栋"
-	now := time.Now()
-	// 取最近的一个 23:00 作为开始，结束为次日 01:00，保证跨零点。
-	startDay := time.Date(now.Year(), now.Month(), now.Day(), 23, 0, 0, 0, time.Local)
-	if startDay.Before(now) {
+	loc := util.CommunityLocation()
+	now := util.CommunityNow()
+	// 取社区时区下未来最近的一个 23:00 作为开始，结束为次日 01:00，保证跨零点。
+	startDay := time.Date(now.Year(), now.Month(), now.Day(), 23, 0, 0, 0, loc)
+	if !startDay.After(now) {
 		startDay = startDay.AddDate(0, 0, 1)
 	}
 	overnightEnd := startDay.Add(2 * time.Hour)
 	if overnightEnd.Day() == startDay.Day() {
 		t.Fatalf("[跨日校验] 构造的时段未跨零点: %s ~ %s", startDay, overnightEnd)
 	}
-	// 从 datetime-local 字符串往返解析，验证跨日字符串被正确还原。
-	s, e1 := ParseVisitTime(startDay.Format("2006-01-02T15:04"))
-	en, e2 := ParseVisitTime(overnightEnd.Format("2006-01-02T15:04"))
+	// 从 datetime-local 钟面串往返解析，验证跨日字符串被按社区时区正确还原。
+	startWall := startDay.Format("2006-01-02T15:04")
+	endWall := overnightEnd.Format("2006-01-02T15:04")
+	s, e1 := ParseVisitTime(startWall)
+	en, e2 := ParseVisitTime(endWall)
 	if e1 != nil || e2 != nil || !s.Equal(startDay) || !en.Equal(overnightEnd) {
 		t.Fatalf("[跨日校验] 跨日时段解析不一致: %v %v", e1, e2)
 	}
@@ -525,6 +532,12 @@ func TestFlow_CrossDayOvernightWindow(t *testing.T) {
 	if detail.EndTime.Sub(detail.StartTime) != 2*time.Hour {
 		t.Fatalf("[跨日校验] 跨日时长应=2h，实际 %s", detail.EndTime.Sub(detail.StartTime))
 	}
+	// 渲染钟面必须与提交钟面逐日逐分一致（跨日不偏移、不错到前一天/后一天）。
+	if util.FormatVisit(detail.StartTime) != strings.Replace(startWall, "T", " ", 1) ||
+		util.FormatVisit(detail.EndTime) != strings.Replace(endWall, "T", " ", 1) {
+		t.Fatalf("[跨日校验] 钟面偏移: 提交 %s~%s 渲染 %s~%s",
+			startWall, endWall, util.FormatVisit(detail.StartTime), util.FormatVisit(detail.EndTime))
+	}
 }
 
 // 用例 10：跨日且已过离场时间未离场 → 逾期标记并恢复容量（失败/兜底发生在逾期阶段）。
@@ -534,17 +547,18 @@ func TestFlow_CrossDayExpiryRestoresCapacity(t *testing.T) {
 	if _, err := env.svc.SetCapacity(building, 1, env.staff.ID); err != nil {
 		t.Fatal(err)
 	}
-	// 构造确定已过去的跨零点时段：前一天 23:00 ~ 昨天 01:00。
-	now := time.Now()
-	expiredEnd := time.Date(now.Year(), now.Month(), now.Day()-1, 1, 0, 0, 0, time.Local)
-	expiredStart := expiredEnd.Add(-2 * time.Hour)
+	// 构造确定已过去的跨零点时段：社区时区昨天 23:00 ~ 今天 01:00。
+	loc := util.CommunityLocation()
+	now := util.CommunityNow()
+	expiredStart := time.Date(now.Year(), now.Month(), now.Day()-1, 23, 0, 0, 0, loc)
+	expiredEnd := expiredStart.Add(2 * time.Hour)
 	if !expiredEnd.Before(now) {
 		t.Fatalf("[逾期阶段] 测试前置时段必须已过期")
 	}
 	p := env.register(building, env.uniquePhone(), expiredStart, expiredEnd)
 	// 经真实持久化把已审核凭证置为在场（模拟访客已进入但跨日未离场）。
 	if err := env.db.Model(&model.VisitorPass{}).Where("id = ?", p.ID).
-		Updates(map[string]any{"status": constants.PassStatusCheckedIn, "check_in_at": expiredStart}).Error; err != nil {
+		Updates(map[string]any{"status": constants.PassStatusCheckedIn, "check_in_at": expiredStart.UTC()}).Error; err != nil {
 		t.Fatalf("[逾期阶段] 前置写入在场状态失败: %v", err)
 	}
 	before := env.capacity(building)

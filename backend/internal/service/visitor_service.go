@@ -67,19 +67,21 @@ func (s *VisitorService) recordEvent(tx *gorm.DB, passID, actorID uint, action, 
 	return nil
 }
 
-// ParseVisitTime 兼容 datetime-local（T 分隔）与 "2006-01-02 15:04"。
+// ParseVisitTime 解析到访时刻。datetime-local / "YYYY-MM-DD HH:mm" 是不含时区的朴素钟面时刻，
+// 一律按社区时区解释（而不是服务器 time.Local），保证业主选择的本地时刻落库后不偏移。
+// 若传入带偏移/RFC3339 的串（旧数据或外部系统），则按其自带时区解析为同一绝对时刻。
 func ParseVisitTime(v string) (time.Time, error) {
 	v = strings.TrimSpace(v)
-	layouts := []string{"2006-01-02T15:04", "2006-01-02 15:04", time.RFC3339}
-	var last error
-	for _, l := range layouts {
-		if t, e := time.ParseInLocation(l, v, time.Local); e == nil {
+	loc := util.CommunityLocation()
+	for _, l := range []string{"2006-01-02T15:04", "2006-01-02 15:04"} {
+		if t, e := time.ParseInLocation(l, v, loc); e == nil {
 			return t, nil
-		} else {
-			last = e
 		}
 	}
-	return time.Time{}, fmt.Errorf("%w: %v", ErrPassTimeInvalid, last)
+	if t, e := time.Parse(time.RFC3339, v); e == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("%w: bad visit time %q", ErrPassTimeInvalid, v)
 }
 
 func genPassNo() string {
@@ -124,7 +126,7 @@ func (s *VisitorService) Create(residentID uint, role, name, phone, building, re
 			return fmt.Errorf("VisitorPass[resident=%d] create failed: %w", residentID, e)
 		}
 		if e = s.recordEvent(tx, pass.ID, residentID, constants.PassActionCreate, "", constants.PassStatusPending,
-			fmt.Sprintf("登记凭证 %s：访客 %s(%s) 到访 %s %s~%s 事由 %s", pass.PassNo, name, phone, building, util.Date(start), util.Date(end), reason)); e != nil {
+			fmt.Sprintf("登记凭证 %s：访客 %s(%s) 到访 %s %s~%s 事由 %s", pass.PassNo, name, phone, building, util.FormatVisit(start), util.FormatVisit(end), reason)); e != nil {
 			return fmt.Errorf("VisitorPass[resident=%d] event failed: %w", residentID, e)
 		}
 		return nil
@@ -341,10 +343,10 @@ func (s *VisitorService) CheckIn(id, guardID uint, checkpoint string) (model.Vis
 			return fmt.Errorf("VisitorPass[%s] checkin rejected: status=%s: %w", v.PassNo, v.Status, ErrPassState)
 		}
 		if now.Before(v.StartTime) {
-			return fmt.Errorf("VisitorPass[%s] checkin rejected: before window %s: %w", v.PassNo, util.Date(v.StartTime), ErrGateNotInWindow)
+			return fmt.Errorf("VisitorPass[%s] checkin rejected: before window %s: %w", v.PassNo, util.FormatVisit(v.StartTime), ErrGateNotInWindow)
 		}
 		if now.After(v.EndTime) {
-			return fmt.Errorf("VisitorPass[%s] checkin rejected: past window %s: %w", v.PassNo, util.Date(v.EndTime), ErrPassState)
+			return fmt.Errorf("VisitorPass[%s] checkin rejected: past window %s: %w", v.PassNo, util.FormatVisit(v.EndTime), ErrPassState)
 		}
 		onsite, e := s.passes.CountInBuilding(v.Building, now, tx)
 		if e != nil {
@@ -428,7 +430,7 @@ func (s *VisitorService) GateVerify(passNo string, guardID uint) (model.VisitorP
 	if s.logs != nil {
 		s.logs.Add(guardID, constants.PassActionGateRead, fmt.Sprintf("门岗核对凭证 %s（%s）", v.PassNo, util.PassStatusText(v.Status)))
 	}
-	now := time.Now()
+	now := util.CommunityNow()
 	allow := false
 	reason := ""
 	switch v.Status {
@@ -460,7 +462,7 @@ func (s *VisitorService) GateVerify(passNo string, guardID uint) (model.VisitorP
 		"reason":       reason,
 		"status_text":  util.PassStatusText(v.Status),
 		"onsite":       onsite,
-		"current_time": now,
+		"current_time": util.FormatVisit(now),
 	}
 	return v, info, nil
 }
@@ -501,7 +503,7 @@ func (s *VisitorService) SweepExpired() (int, error) {
 				return nil
 			}
 			if e = s.recordEvent(tx, id, 0, constants.PassActionExpire, from, constants.PassStatusExpired,
-				fmt.Sprintf("凭证 %s 超过离场时间 %s 未离场，系统标记逾期，容量恢复", passNo, util.Date(endAt))); e != nil {
+				fmt.Sprintf("凭证 %s 超过离场时间 %s 未离场，系统标记逾期，容量恢复", passNo, util.FormatVisit(endAt))); e != nil {
 				return e
 			}
 			marked++

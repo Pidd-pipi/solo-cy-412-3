@@ -160,6 +160,15 @@ OpenAPI 摘要位于 `backend/api/openapi.yaml`。
 - **并发安全**：所有状态变更在数据库事务内执行。先对 `building_capacities` 楼栋行加写锁（MySQL `SELECT … FOR UPDATE`，SQLite 用 WAL + busy_timeout 排队）将同楼栋操作串行化；再以条件更新 `UPDATE … WHERE id=? AND status IN (?)`（CAS，按 RowsAffected 判定）迁移状态。因此两名物业并发审核同一凭证或同一楼栋一批凭证时只有一个成功、已承诺名额（已通过+在场）绝不越上限；同一凭证并发办理进入/离开只成功一次，终态不被改写，失败请求明确返回 409 且不产生任何留痕。SQLite 文件库默认开启 `_journal_mode=WAL&_busy_timeout=5000`。
 - **授权**：登记仅业主可发起（路由 `RequireRole(resident)` + service 双重校验）；取消仅凭证登记业主本人，物业/门岗/管理员不能代他人创建或取消；审核需 `visitor:review`，门岗进出需 `visitor:gate`。
 
+### 到访时段与时区（本地时刻一致性）
+
+- 浏览器 `datetime-local` 提交的是**不含时区的本地钟面时刻**（如 `2026-09-16 23:30`）。后端固定按"社区时区"解释，而非服务器 `time.Local`（Docker 容器通常是 UTC），避免跨时区部署整体偏移、跨日错天。
+- 社区时区由 `APP_TIMEZONE` 配置，缺省 `Asia/Shanghai`，无 tzdata 时回退固定 `UTC+8`（见 `util/timezone.go` 的 `CommunityLocation/FormatVisit`）。
+- 解析（保存）：`service.ParseVisitTime` 用社区时区把钟面串转成绝对时刻；带偏移/RFC3339 的旧数据按其自带时区解析。
+- 存储：`VisitorPass/VisitorEvent` 的 `BeforeSave` 钩子把所有时刻归一化为 **UTC 绝对时刻**入库，保证 SQLite 字符串时序比较与 MySQL 一致（重叠、到期查询）。
+- 读取：接口返回 `PassView/PassEventView`，开始/结束/进出/审核时刻统一格式化为社区钟面串 `YYYY-MM-DD HH:mm`（无时区），前端 `utils/visitTime.ts` 原样显示，**业主、物业、门岗在任意浏览器/服务器时区看到同一本地时刻，跨零点不偏移；旧记录按原值展示**。
+- 判定：门岗放行、取消、逾期与容量恢复都基于存储的 UTC 绝对时刻比较，与时区无关；门岗核对返回的 `current_time` 也是社区钟面。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |

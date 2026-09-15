@@ -29,7 +29,8 @@ func (h *GateHandler) Verify(c *gin.Context) {
 		failVisitor(c, e)
 		return
 	}
-	OK(c, mapInfo(v, info))
+	info["pass"] = mapPass(v)
+	OK(c, info)
 }
 
 // CheckIn 门岗办理进入。
@@ -46,7 +47,7 @@ func (h *GateHandler) CheckIn(c *gin.Context) {
 		failVisitor(c, e)
 		return
 	}
-	OK(c, v)
+	OK(c, mapPass(v))
 }
 
 // CheckOut 门岗办理离开。
@@ -63,7 +64,7 @@ func (h *GateHandler) CheckOut(c *gin.Context) {
 		failVisitor(c, e)
 		return
 	}
-	OK(c, v)
+	OK(c, mapPass(v))
 }
 
 // Records 门岗记录：最近的进出/审核留痕。
@@ -74,11 +75,5 @@ func (h *GateHandler) Records(c *gin.Context) {
 		Fail(c, 500, 50001, e.Error())
 		return
 	}
-	OK(c, v)
-}
-
-// mapInfo 组装门岗核对响应。
-func mapInfo(v any, info map[string]any) map[string]any {
-	info["pass"] = v
-	return info
+	OK(c, mapEvents(v))
 }
