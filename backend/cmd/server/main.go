@@ -27,6 +27,10 @@ func main() {
 	if err = db.AutoMigrate(&model.User{}, &model.Repair{}, &model.Payment{}, &model.Announcement{}, &model.AnnouncementRead{}, &model.OperationLog{}, &model.Role{}, &model.Permission{}, &model.RolePermission{}, &model.VisitorPass{}, &model.VisitorEvent{}, &model.BuildingCapacity{}); err != nil {
 		log.Fatal(err)
 	}
+	// 升级兼容：把存量访客记录的带偏移时刻幂等归一化为 UTC（钟面时刻不变）。
+	if _, err = repository.NormalizeVisitorTimes(db); err != nil {
+		log.Printf("normalize visitor times: %v", err)
+	}
 	if err = seed(db); err != nil {
 		log.Fatal(err)
 	}
