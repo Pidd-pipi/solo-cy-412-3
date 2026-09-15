@@ -49,8 +49,13 @@ func (s *VisitorService) withTx(fn func(tx *gorm.DB) error) error {
 }
 
 // recordEvent 在同一事务内写访客留痕与系统操作日志，保证取消/审核/进出/逾期必留痕且与状态变更同提交。
+// actorID 为 0 表示系统动作（定时逾期），访客事件的 actor_id 写 NULL，避免外键指向不存在的用户。
 func (s *VisitorService) recordEvent(tx *gorm.DB, passID, actorID uint, action, from, to, detail string) error {
-	if e := s.events.Create(&model.VisitorEvent{PassID: passID, ActorID: actorID, Action: action, FromStatus: from, ToStatus: to, Detail: detail}, tx); e != nil {
+	var actorPtr *uint
+	if actorID > 0 {
+		actorPtr = &actorID
+	}
+	if e := s.events.Create(&model.VisitorEvent{PassID: passID, ActorID: actorPtr, Action: action, FromStatus: from, ToStatus: to, Detail: detail}, tx); e != nil {
 		s.logger.Error("write visitor event", "pass_id", passID, "action", action, "error", e)
 		return e
 	}
@@ -510,6 +515,8 @@ func (s *VisitorService) SweepExpired() (int, error) {
 }
 
 // CapacityOverview 物业工作台：各楼栋容量上限、当前在场、剩余数量。
+// 剩余数量 = 上限 - 已承诺名额（已通过待进入 + 在场），因此恒等于当前还能审核通过的数量，
+// 保证容量页展示与审核闸门一致。
 func (s *VisitorService) CapacityOverview() ([]map[string]any, error) {
 	cfgs, e := s.caps.List()
 	if e != nil {
@@ -522,11 +529,21 @@ func (s *VisitorService) CapacityOverview() ([]map[string]any, error) {
 		if e != nil {
 			return nil, e
 		}
-		remaining := c.DailyLimit - int(onsite)
+		committed, e := s.passes.CountOccupied(c.Building, nil)
+		if e != nil {
+			return nil, e
+		}
+		remaining := c.DailyLimit - int(committed)
 		if c.DailyLimit == 0 {
 			remaining = -1 // 0 表示不限
 		}
-		out = append(out, map[string]any{"building": c.Building, "daily_limit": c.DailyLimit, "onsite": onsite, "remaining": remaining})
+		out = append(out, map[string]any{
+			"building":    c.Building,
+			"daily_limit": c.DailyLimit,
+			"onsite":      onsite,
+			"committed":   committed,
+			"remaining":   remaining,
+		})
 	}
 	return out, nil
 }

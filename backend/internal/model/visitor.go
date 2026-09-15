@@ -28,12 +28,13 @@ type VisitorPass struct {
 }
 
 // VisitorEvent 访客凭证全生命周期留痕：取消、审核、进出与逾期各写一条。
+// ActorID 为系统动作（如定时逾期标记）时为 NULL。
 type VisitorEvent struct {
 	ID         uint        `gorm:"primaryKey" json:"id"`
 	PassID     uint        `gorm:"index" json:"pass_id"`
 	Pass       VisitorPass `gorm:"foreignKey:PassID" json:"pass,omitempty"`
 	Action     string      `gorm:"index;size:40" json:"action"`
-	ActorID    uint        `json:"actor_id"`
+	ActorID    *uint       `json:"actor_id"`
 	Actor      *User       `gorm:"foreignKey:ActorID" json:"actor,omitempty"`
 	FromStatus string      `gorm:"size:20" json:"from_status"`
 	ToStatus   string      `gorm:"size:20" json:"to_status"`

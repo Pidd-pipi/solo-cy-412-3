@@ -17,7 +17,7 @@
           <div class="cap-num" :class="{ full: c.daily_limit > 0 && c.remaining <= 0 }">
             剩余 {{ c.daily_limit === 0 ? '不限' : c.remaining }}
           </div>
-          <div class="cap-sub">在场 {{ c.onsite }} / 上限 {{ c.daily_limit === 0 ? '不限' : c.daily_limit }}</div>
+          <div class="cap-sub">在场 {{ c.onsite }} / 已约 {{ c.committed ?? c.onsite }} / 上限 {{ c.daily_limit === 0 ? '不限' : c.daily_limit }}</div>
           <el-button size="small" link @click="editCap(c)">调整上限</el-button>
         </el-card>
         <el-card class="cap-card add" shadow="never" @click="addCap">

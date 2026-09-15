@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS visitor_events (
   id          BIGINT PRIMARY KEY AUTO_INCREMENT,
   pass_id     BIGINT NOT NULL,
   action      VARCHAR(40) NOT NULL,
-  actor_id    BIGINT NOT NULL,
+  actor_id    BIGINT NULL,
   from_status VARCHAR(20),
   to_status   VARCHAR(20),
   detail      TEXT,
