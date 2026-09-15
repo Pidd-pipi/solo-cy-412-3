@@ -1,0 +1,1 @@
+import {request} from '../utils/request';import type{Payment}from '../types';export const listPayments=()=>request<Payment[]>('/payments');export const payPayment=(id:number)=>request<Payment>(`/payments/${id}/pay`,{method:'POST'});

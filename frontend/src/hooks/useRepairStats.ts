@@ -1,0 +1,1 @@
+import {computed,type Ref}from'vue';import type{Repair}from'../types';export function useRepairStats(items:Ref<Repair[]>){return computed(()=>items.value.reduce<Record<string,number>>((a,v)=>(a[v.status]=(a[v.status]||0)+1,a),{}))}

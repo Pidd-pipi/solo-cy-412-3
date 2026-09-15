@@ -1,0 +1,63 @@
+name: smartestate
+services:
+  db:
+    image: mysql:8.0
+    container_name: ${COMPOSE_PROJECT_NAME:-smartestate}-db
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    ports:
+      - "${DB_PORT:-3306}:3306"
+    volumes:
+      - smartestate_mysql_data:/var/lib/mysql
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    networks: [smartestate_net]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+  backend:
+    build:
+      context: ./backend
+    container_name: ${COMPOSE_PROJECT_NAME:-smartestate}-backend
+    restart: unless-stopped
+    environment:
+      APP_PORT: 8080
+      DB_DRIVER: mysql
+      DB_DSN: ${DB_USER}:${DB_PASSWORD}@tcp(db:3306)/${DB_NAME}?charset=utf8mb4&parseTime=True&loc=Local
+      JWT_SECRET: ${JWT_SECRET}
+      RATE_LIMIT_PER_MINUTE: 120
+    ports:
+      - "${BACKEND_PORT:-19412}:8080"
+    networks: [smartestate_net]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 10s
+  frontend:
+    build:
+      context: ./frontend
+    container_name: ${COMPOSE_PROJECT_NAME:-smartestate}-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-18412}:80"
+    networks: [smartestate_net]
+    depends_on:
+      backend:
+        condition: service_healthy
+networks:
+  smartestate_net:
+    name: ${COMPOSE_PROJECT_NAME:-smartestate}_net
+volumes:
+  smartestate_mysql_data:
+    name: ${COMPOSE_PROJECT_NAME:-smartestate}_mysql_data

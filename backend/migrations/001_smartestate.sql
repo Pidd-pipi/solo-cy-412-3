@@ -1,0 +1,2 @@
+-- Schema is migrated by GORM for the demo; this migration records User/Repair/Payment/Announcement and RBAC schema ownership.
+-- MySQL deployment initializes from database/init.sql and this directory is reserved for versioned production migrations.

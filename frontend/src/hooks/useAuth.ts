@@ -1,0 +1,1 @@
+import {computed}from'vue';import {authStore}from'../stores/authStore';export function useAuth(){return{user:computed(()=>authStore.user),isStaff:computed(()=>['staff','admin'].includes(authStore.user?.role||'')),isAdmin:computed(()=>authStore.user?.role==='admin')}}

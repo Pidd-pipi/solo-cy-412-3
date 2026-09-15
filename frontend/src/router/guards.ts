@@ -1,0 +1,1 @@
+import type{Router}from'vue-router';import{authStore}from'../stores/authStore';export function installGuards(router:Router){router.beforeEach(to=>{if(to.path!=='/login'&&!authStore.token)return'/login';if(to.path==='/login'&&authStore.token)return'/dashboard';return true})}

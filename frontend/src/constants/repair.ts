@@ -1,0 +1,1 @@
+import type {RepairStatus} from '../types'; export const REPAIR_STATUS:Record<Uppercase<RepairStatus>,RepairStatus>={PENDING:'pending',ASSIGNED:'assigned',PROCESSING:'processing',DONE:'done',CLOSED:'closed'}; export const repairStatusText:Record<RepairStatus,string>={pending:'待受理',assigned:'已分派',processing:'处理中',done:'已完成',closed:'已关闭'};
