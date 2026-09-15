@@ -10,7 +10,11 @@ func (s *PermissionService) Has(role, permission string) bool {
 		return true
 	}
 	if role == "staff" {
-		return permission == constants.PermissionRepairManage || permission == constants.PermissionPaymentManage || permission == constants.PermissionAnnouncementPublish
+		return permission == constants.PermissionRepairManage ||
+			permission == constants.PermissionPaymentManage ||
+			permission == constants.PermissionAnnouncementPublish ||
+			permission == constants.PermissionVisitorReview ||
+			permission == constants.PermissionVisitorGate
 	}
 	return false
 }

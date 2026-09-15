@@ -1,8 +1,23 @@
 openapi: 3.0.3
-info: { title: SmartEstate API, version: 1.0.0 }
+info: { title: SmartEstate API, version: 1.1.0 }
 paths:
   /healthz: { get: { summary: Health check } }
   /api/v1/auth/login: { post: { summary: Login } }
   /api/v1/repairs: { get: { summary: List repairs }, post: { summary: Create repair } }
   /api/v1/payments: { get: { summary: List payments }, post: { summary: Create bill } }
   /api/v1/announcements: { get: { summary: List announcements }, post: { summary: Publish announcement } }
+  # 访客通行模块
+  /api/v1/visitor/passes:
+    get: { summary: 访客凭证列表（业主仅本人，物业可按 status/building 筛选） }
+    post: { summary: 业主登记访客凭证，生成仅本时段有效的凭证 }
+  /api/v1/visitor/passes/{id}: { get: { summary: 凭证详情及全生命周期留痕 } }
+  /api/v1/visitor/passes/{id}/cancel: { post: { summary: 业主/物业取消凭证 } }
+  /api/v1/visitor/passes/{id}/approve: { post: { summary: 物业审核通过，容量满时 409 } }
+  /api/v1/visitor/passes/{id}/reject: { post: { summary: 物业审核驳回 } }
+  /api/v1/visitor/capacity:
+    get: { summary: 各楼栋当日容量上限/在场/剩余 }
+    put: { summary: 调整楼栋当日容量上限 }
+  /api/v1/gate/verify: { get: { summary: 门岗按凭证号核对，返回 allow 与不可放行原因 } }
+  /api/v1/gate/passes/{id}/checkin: { post: { summary: 门岗办理进入，实时占用容量 } }
+  /api/v1/gate/passes/{id}/checkout: { post: { summary: 门岗办理离开，实时恢复容量 } }
+  /api/v1/gate/records: { get: { summary: 门岗最近进出/审核留痕 } }

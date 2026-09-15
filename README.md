@@ -18,7 +18,8 @@ docker compose up -d
 
 ## 主要功能
 
-- **物业工作台**：汇总待办报修、本月已收费用和近期公告。
+- **物业工作台**：汇总待办报修、待审访客凭证、本月已收费用和近期公告。
+- **访客通行**：业主登记访客（姓名、手机号、到访时段、楼栋、事由）生成仅本时段有效的凭证；同一访客同一楼栋重叠时段仅一张有效凭证；物业审核、门岗核对进出；楼栋在场容量实时增减，满员暂停审核；取消/审核/进出/逾期全程留痕。
 - **报修管理**：业主创建水电/家具/公共设施等报修；物业筛选、分配和更新进度。
 - **费用缴纳**：按业主展示账单，通过支付宝沙箱模拟完成支付和记录查询。
 - **社区公告**：置顶、发布、详情查看与阅读计数。
@@ -75,8 +76,23 @@ cd backend && go build ./...
 | POST | `/payments/:id/pay` | 模拟支付（限流） |
 | GET/POST | `/announcements` | 公告列表 / 发布，发布需 `announcement:publish` |
 | GET | `/announcements/:id` | 公告详情并记录阅读 |
-| GET | `/dashboard/summary` | 工作台汇总 |
+| GET | `/dashboard/summary` | 工作台汇总（含待审访客凭证数） |
 | GET | `/operation-logs` | 操作日志，`log:read` |
+
+访客通行模块（业主端、门岗 `visitor:gate`、物业审核 `visitor:review`）：
+
+| 方法 | 接口 | 用途 / 权限 |
+| --- | --- | --- |
+| GET/POST | `/visitor/passes` | 凭证列表（业主仅本人）/ 业主登记 |
+| GET | `/visitor/passes/:id` | 凭证详情与全生命周期留痕 |
+| POST | `/visitor/passes/:id/cancel` | 业主/物业取消（仅待审核/已通过可取消） |
+| POST | `/visitor/passes/:id/approve` | 物业审核通过，容量满返回 409，`visitor:review` |
+| POST | `/visitor/passes/:id/reject` | 物业驳回，`visitor:review` |
+| GET/PUT | `/visitor/capacity` | 楼栋容量总览 / 调整上限，`visitor:review` |
+| GET | `/gate/verify?pass_no=` | 门岗核对凭证，返回 `allow` 与原因，`visitor:gate` |
+| POST | `/gate/passes/:id/checkin` | 门岗办理进入，`visitor:gate` |
+| POST | `/gate/passes/:id/checkout` | 门岗办理离开，`visitor:gate` |
+| GET | `/gate/records` | 门岗最近进出/审核留痕，`visitor:gate` |
 
 OpenAPI 摘要位于 `backend/api/openapi.yaml`。
 
@@ -85,15 +101,15 @@ OpenAPI 摘要位于 `backend/api/openapi.yaml`。
 ```text
 .
 ├── frontend/
-│   ├── src/api/                # user、repair、payment、announcement 请求
-│   ├── src/stores/             # authStore、userStore、repairStore、paymentStore
+│   ├── src/api/                # user、repair、payment、announcement、visitor 请求
+│   ├── src/stores/             # authStore、userStore、repairStore、paymentStore、visitorStore
 │   ├── src/types/              # 共享实体和 permission 类型
-│   ├── src/components/common/  # StatCard、RepairStatusBadge、RepairCard 等
+│   ├── src/components/common/  # StatCard、RepairStatusBadge、RepairCard、PassStatusBadge、PassCard 等
 │   ├── src/hooks/              # useAuth、useRepairStats、usePermission
-│   ├── src/pages/              # Dashboard、Repairs、Payments、Announcements、Profile
+│   ├── src/pages/              # Dashboard、Repairs、Payments、Announcements、Profile、Visits、VisitorReview、Gate
 │   ├── src/router/             # 路由及 guards
-│   ├── src/utils/              # request、roleText、feeCalculator
-│   └── src/constants/          # repair、user、errorCodes
+│   ├── src/utils/              # request、roleText、feeCalculator、visitTime
+│   └── src/constants/          # repair、user、visitor、errorCodes
 ├── backend/
 │   ├── cmd/server/main.go
 │   ├── internal/{config,model,repository,service,handler,router,middleware,dto,constants,util}
@@ -126,6 +142,21 @@ OpenAPI 摘要位于 `backend/api/openapi.yaml`。
 - 后端使用：`backend/internal/service/permission_service.go`、`backend/internal/middleware/auth.go`、`middleware/rbac.go`、路由权限与 `backend/internal/util/formatter.go`。
 - 前端定义：`frontend/src/constants/user.ts`、`frontend/src/types/index.ts`。
 - 前端使用：`frontend/src/stores/authStore.ts`、`frontend/src/hooks/useAuth.ts`、`usePermission.ts`、`frontend/src/router/index.ts` 的 meta、`router/guards.ts`、`components/common/PermissionButton.ts`、`utils/roleText.ts` 与 `App.vue`。
+
+### PassStatus（访客凭证状态）
+
+- 值：PENDING = 'pending'（待审核）、APPROVED = 'approved'（已通过）、CHECKED_IN = 'checked_in'（在场）、COMPLETED = 'completed'（已完成/已离开）、CANCELLED = 'cancelled'（已取消）、REJECTED = 'rejected'（已驳回）、EXPIRED = 'expired'（已逾期）。
+- 状态机：`pending → approved → checked_in → completed`；`pending/approved → cancelled`；`pending → rejected`；`approved/checked_in → expired`（定时任务兜底）。
+- 后端定义：`backend/internal/constants/visitor.go`；模型 `backend/internal/model/visitor.go` 的 `VisitorPass.Status`。
+- 后端使用：`service/visitor_service.go` 状态机与事务、`repository/visitor_repository.go`（重叠与在场统计）、`util/formatter.go`（PassStatusText/PassActionText）、`constants/log_templates.go`、`constants/messages.go`、`constants/permissions.go`（`visitor:review`/`visitor:gate`）、`handler/visitor_handler.go`、`handler/gate_handler.go`、`handler/building_capacity_handler.go`、`router/visitors.go`、`cmd/server/main.go`（装配、迁移、逾期扫描协程）。
+- 前端定义：`frontend/src/constants/visitor.ts`、`frontend/src/types/index.ts`。
+- 前端使用：`components/common/PassStatusBadge.vue`、`PassCard.vue`、`pages/Visits.vue`（业主端）、`pages/VisitorReview.vue`（物业审核/容量）、`pages/Gate.vue`（门岗核对/进出记录）、`api/visitor.ts`、`stores/visitorStore.ts`、`router/index.ts`、`App.vue` 导航。
+- 留痕：每次取消、审核、进入、离开、逾期都在同一数据库事务内写 `visitor_events` 与 `operation_logs`（见 `migrations/002_visitor_passes.sql`）。
+
+### 容量规则（BuildingCapacity）
+
+- 在场人数不做累加计数，而由 `visitor_passes.status='checked_in'` 实时统计：进入即减剩余、离开或逾期标记后自动恢复，杜绝计数器与实际状态不一致。
+- 审核通过与办理进入两个节点都在事务内复核 `在场数 < 当日上限`，达到上限返回业务冲突码 `40901` 并暂停新凭证审核。
 
 ## 环境变量
 
