@@ -26,6 +26,8 @@ var (
 	ErrGateNotInWindow = errors.New("visitor pass not in visit window")
 	ErrGateAlreadyIn   = errors.New("visitor already checked in")
 	ErrGateNotIn       = errors.New("visitor not checked in")
+	// ErrStateLost 并发竞争中本事务未能抢到状态迁移（CAS 失败）：明确失败、不留痕。
+	ErrStateLost = errors.New("visitor pass state changed by a concurrent request")
 )
 
 type VisitorService struct {
@@ -81,10 +83,14 @@ func genPassNo() string {
 	return fmt.Sprintf("V%s%02X%02X%02X", time.Now().Format("01021504"), b[0], b[1], b[2])
 }
 
-// Create 业主登记访客凭证。
-func (s *VisitorService) Create(residentID uint, name, phone, building, reason string, start, end time.Time) (model.VisitorPass, error) {
+// Create 业主登记访客凭证。仅业主可发起；物业/门岗不能代替业主创建。
+// 同一访客手机号+楼栋在有效状态下的重叠时段，并发登记也只能成功一张（楼栋锁串行 + 事务内复核）。
+func (s *VisitorService) Create(residentID uint, role, name, phone, building, reason string, start, end time.Time) (model.VisitorPass, error) {
+	if role != constants.UserRoleResident {
+		return model.VisitorPass{}, fmt.Errorf("VisitorPass[resident=%d] create forbidden: role=%s: %w", residentID, role, ErrPassForbidden)
+	}
 	if !end.After(start) {
-		return model.VisitorPass{}, fmt.Errorf("VisitorPass[resident=%d] create failed: end before start, role=%s: %w", residentID, constants.UserRoleResident, ErrPassTimeInvalid)
+		return model.VisitorPass{}, fmt.Errorf("VisitorPass[resident=%d] create failed: end before start, role=%s: %w", residentID, role, ErrPassTimeInvalid)
 	}
 	pass := model.VisitorPass{
 		PassNo:       genPassNo(),
@@ -98,6 +104,10 @@ func (s *VisitorService) Create(residentID uint, name, phone, building, reason s
 		Status:       constants.PassStatusPending,
 	}
 	e := s.withTx(func(tx *gorm.DB) error {
+		// 楼栋锁串行化同楼栋登记，杜绝两个并发请求同时通过重叠检查。
+		if _, e := s.caps.EnsureLock(tx, building, constants.DefaultBuildingDailyLimit); e != nil {
+			return fmt.Errorf("VisitorPass[building=%s] lock failed: %w", building, e)
+		}
 		n, e := s.passes.FindOverlap(phone, building, start, end, 0, tx)
 		if e != nil {
 			return fmt.Errorf("VisitorPass[phone=%s] overlap query failed: %w", phone, e)
@@ -145,8 +155,20 @@ func (s *VisitorService) Detail(id, uid uint, role string) (model.VisitorPass, [
 }
 
 // Approve 物业审核通过；楼栋在场容量已达上限时暂停审核。
+// 两名物业并发审核同一凭证或同一楼栋的一批凭证时，由楼栋行锁串行化容量判定，
+// 并以状态 CAS 保证同一凭证只被审核成功一次，失败者明确返回冲突且不留痕。
 func (s *VisitorService) Approve(id, reviewerID uint, remark string) (model.VisitorPass, error) {
-	e := s.withTx(func(tx *gorm.DB) error {
+	// 事务外先取楼栋标识；事务内第一条语句即楼栋写锁，避免并发事务各持共享锁后升级死锁。
+	pre, e := s.passes.ByID(id, nil)
+	if e != nil {
+		return model.VisitorPass{}, fmt.Errorf("VisitorPass[id=%d] approve failed: %w", id, ErrPassNotFound)
+	}
+	e = s.withTx(func(tx *gorm.DB) error {
+		capCfg, e := s.caps.EnsureLock(tx, pre.Building, constants.DefaultBuildingDailyLimit)
+		if e != nil {
+			return fmt.Errorf("VisitorPass[id=%d] capacity lock failed: %w", id, e)
+		}
+		// 拿锁后读最新状态，确保看到并发审核/取消的已提交结果。
 		v, e := s.passes.ByID(id, tx)
 		if e != nil {
 			return fmt.Errorf("VisitorPass[id=%d] approve failed: %w", id, ErrPassNotFound)
@@ -154,27 +176,34 @@ func (s *VisitorService) Approve(id, reviewerID uint, remark string) (model.Visi
 		if v.Status != constants.PassStatusPending {
 			return fmt.Errorf("VisitorPass[id=%d] approve rejected: status=%s: %w", id, v.Status, ErrPassState)
 		}
-		now := time.Now()
-		if v.EndTime.Before(now) {
+		if v.EndTime.Before(time.Now()) {
 			return fmt.Errorf("VisitorPass[id=%d] approve rejected: window expired: %w", id, ErrPassState)
 		}
-		capCfg, e := s.caps.GetOrCreate(v.Building, tx)
+		now := time.Now()
+		// 已承诺名额 = 已通过（待进入）+ 在场；审核通过即预留名额，避免一批凭证被超额审核。
+		committed, e := s.passes.CountOccupied(v.Building, tx)
 		if e != nil {
-			return fmt.Errorf("VisitorPass[id=%d] capacity query failed: %w", id, e)
+			return fmt.Errorf("VisitorPass[id=%d] capacity count failed: %w", id, e)
+		}
+		if capCfg.DailyLimit > 0 && int(committed) >= capCfg.DailyLimit {
+			return fmt.Errorf("VisitorPass[id=%d building=%s] approve suspended: committed=%d limit=%d: %w", id, v.Building, committed, capCfg.DailyLimit, ErrCapacityReached)
 		}
 		onsite, e := s.passes.CountInBuilding(v.Building, now, tx)
 		if e != nil {
 			return fmt.Errorf("VisitorPass[id=%d] onsite count failed: %w", id, e)
 		}
-		if capCfg.DailyLimit > 0 && int(onsite) >= capCfg.DailyLimit {
-			return fmt.Errorf("VisitorPass[id=%d building=%s] approve suspended: onsite=%d limit=%d: %w", id, v.Building, onsite, capCfg.DailyLimit, ErrCapacityReached)
-		}
-		v.Status = constants.PassStatusApproved
-		v.ReviewerID = &reviewerID
-		v.ReviewRemark = remark
-		v.ReviewedAt = &now
-		if e = s.passes.Update(&v, tx); e != nil {
+		// CAS：仅 pending 可迁移为 approved，并发重复审核只有一次 RowsAffected=1。
+		changed, e := s.passes.Transition(id, []string{constants.PassStatusPending}, map[string]any{
+			"status":        constants.PassStatusApproved,
+			"reviewer_id":   reviewerID,
+			"review_remark": remark,
+			"reviewed_at":   now,
+		}, tx)
+		if e != nil {
 			return fmt.Errorf("VisitorPass[id=%d] approve failed: %w", id, e)
+		}
+		if !changed {
+			return fmt.Errorf("VisitorPass[id=%d] approve lost race, current status not pending: %w", id, ErrStateLost)
 		}
 		if e = s.recordEvent(tx, id, reviewerID, constants.PassActionApprove, constants.PassStatusPending, constants.PassStatusApproved,
 			fmt.Sprintf("凭证 %s 审核通过，楼栋 %s 当前在场 %d/%d", v.PassNo, v.Building, onsite, capCfg.DailyLimit)); e != nil {
@@ -188,26 +217,28 @@ func (s *VisitorService) Approve(id, reviewerID uint, remark string) (model.Visi
 	return s.passes.ByID(id, nil)
 }
 
-// Reject 物业驳回待审核凭证。
+// Reject 物业驳回待审核凭证。并发审核同一凭证时与 Approve 互斥，只有一次迁移成功。
 func (s *VisitorService) Reject(id, reviewerID uint, remark string) (model.VisitorPass, error) {
-	e := s.withTx(func(tx *gorm.DB) error {
-		v, e := s.passes.ByID(id, tx)
+	pre, e := s.passes.ByID(id, nil)
+	if e != nil {
+		return model.VisitorPass{}, fmt.Errorf("VisitorPass[id=%d] reject failed: %w", id, ErrPassNotFound)
+	}
+	e = s.withTx(func(tx *gorm.DB) error {
+		// 首条语句即条件写（CAS），立即取得写锁，并发驳回/通过只一方成功。
+		changed, e := s.passes.Transition(id, []string{constants.PassStatusPending}, map[string]any{
+			"status":        constants.PassStatusRejected,
+			"reviewer_id":   reviewerID,
+			"review_remark": remark,
+			"reviewed_at":   time.Now(),
+		}, tx)
 		if e != nil {
-			return fmt.Errorf("VisitorPass[id=%d] reject failed: %w", id, ErrPassNotFound)
-		}
-		if v.Status != constants.PassStatusPending {
-			return fmt.Errorf("VisitorPass[id=%d] reject rejected: status=%s: %w", id, v.Status, ErrPassState)
-		}
-		now := time.Now()
-		v.Status = constants.PassStatusRejected
-		v.ReviewerID = &reviewerID
-		v.ReviewRemark = remark
-		v.ReviewedAt = &now
-		if e = s.passes.Update(&v, tx); e != nil {
 			return fmt.Errorf("VisitorPass[id=%d] reject failed: %w", id, e)
 		}
+		if !changed {
+			return fmt.Errorf("VisitorPass[id=%d] reject lost race, current status not pending: %w", id, ErrStateLost)
+		}
 		if e = s.recordEvent(tx, id, reviewerID, constants.PassActionReject, constants.PassStatusPending, constants.PassStatusRejected,
-			fmt.Sprintf("凭证 %s 审核驳回：%s", v.PassNo, remark)); e != nil {
+			fmt.Sprintf("凭证 %s 审核驳回：%s", pre.PassNo, remark)); e != nil {
 			return e
 		}
 		return nil
@@ -218,26 +249,44 @@ func (s *VisitorService) Reject(id, reviewerID uint, remark string) (model.Visit
 	return s.passes.ByID(id, nil)
 }
 
-// Cancel 业主取消本人凭证，或物业取消任意凭证；仅待审核/已通过可取消。
+// Cancel 仅登记该凭证的业主本人可取消；物业、门岗、管理员均不能代替业主取消他人凭证。
+// 仅待审核/已通过可取消；并发取消、取消与审核/进入竞争时由楼栋锁 + CAS 保证只成功一次。
 func (s *VisitorService) Cancel(id, uid uint, role string) (model.VisitorPass, error) {
-	e := s.withTx(func(tx *gorm.DB) error {
+	pre, e := s.passes.ByID(id, nil)
+	if e != nil {
+		return model.VisitorPass{}, fmt.Errorf("VisitorPass[id=%d] cancel failed: %w", id, ErrPassNotFound)
+	}
+	// 只有业主本人能取消自己登记的凭证。
+	if role != constants.UserRoleResident || pre.ResidentID != uid {
+		return model.VisitorPass{}, fmt.Errorf("VisitorPass[id=%d] cancel forbidden: owner=%d user=%d role=%s: %w", id, pre.ResidentID, uid, role, ErrPassForbidden)
+	}
+	e = s.withTx(func(tx *gorm.DB) error {
+		// 首条语句即楼栋写锁，与审核/进入串行。
+		if _, e := s.caps.EnsureLock(tx, pre.Building, constants.DefaultBuildingDailyLimit); e != nil {
+			return fmt.Errorf("VisitorPass[id=%d] capacity lock failed: %w", id, e)
+		}
 		v, e := s.passes.ByID(id, tx)
 		if e != nil {
-			return fmt.Errorf("VisitorPass[id=%d] cancel failed: %w", id, ErrPassNotFound)
+			return fmt.Errorf("VisitorPass[id=%d] cancel reload failed: %w", id, ErrPassNotFound)
 		}
-		if role == constants.UserRoleResident && v.ResidentID != uid {
+		if v.ResidentID != uid {
 			return fmt.Errorf("VisitorPass[id=%d] cancel forbidden: owner=%d user=%d: %w", id, v.ResidentID, uid, ErrPassForbidden)
 		}
 		if v.Status != constants.PassStatusPending && v.Status != constants.PassStatusApproved {
 			return fmt.Errorf("VisitorPass[id=%d] cancel rejected: status=%s: %w", id, v.Status, ErrPassState)
 		}
 		from := v.Status
-		v.Status = constants.PassStatusCancelled
-		if e = s.passes.Update(&v, tx); e != nil {
+		changed, e := s.passes.Transition(id, []string{constants.PassStatusPending, constants.PassStatusApproved}, map[string]any{
+			"status": constants.PassStatusCancelled,
+		}, tx)
+		if e != nil {
 			return fmt.Errorf("VisitorPass[id=%d] cancel failed: %w", id, e)
 		}
+		if !changed {
+			return fmt.Errorf("VisitorPass[id=%d] cancel lost race: %w", id, ErrStateLost)
+		}
 		if e = s.recordEvent(tx, id, uid, constants.PassActionCancel, from, constants.PassStatusCancelled,
-			fmt.Sprintf("凭证 %s 被 %s 取消", v.PassNo, util.RoleText(role))); e != nil {
+			fmt.Sprintf("凭证 %s 被业主 %s 取消", v.PassNo, util.RoleText(role))); e != nil {
 			return e
 		}
 		return nil
@@ -248,28 +297,42 @@ func (s *VisitorService) Cancel(id, uid uint, role string) (model.VisitorPass, e
 	return s.passes.ByID(id, nil)
 }
 
-// CheckIn 门岗办理进入：仅已通过且在到访时段内可放行；重复进入无效。
+// CheckIn 门岗办理进入：仅已通过且在到访时段内可放行。
+// 同一凭证并发办理进入时，由楼栋行锁串行 + 状态 CAS 保证只成功一次：
+// 先提交者置为 checked_in 并留痕，后到者读到终态后明确返回"已办理过进入"，不写重复记录。
 func (s *VisitorService) CheckIn(id, guardID uint, checkpoint string) (model.VisitorPass, error) {
-	e := s.withTx(func(tx *gorm.DB) error {
+	pre, e := s.passes.ByID(id, nil)
+	if e != nil {
+		return model.VisitorPass{}, fmt.Errorf("VisitorPass[id=%d] checkin failed: %w", id, ErrPassNotFound)
+	}
+	e = s.withTx(func(tx *gorm.DB) error {
+		// 首条语句即楼栋写锁，同楼栋进入彼此串行，容量判定与状态迁移原子。
+		capCfg, e := s.caps.EnsureLock(tx, pre.Building, constants.DefaultBuildingDailyLimit)
+		if e != nil {
+			return fmt.Errorf("VisitorPass[%s] capacity lock failed: %w", pre.PassNo, e)
+		}
+		// 拿锁后读最新状态，确保看到此前已提交的进入/取消/逾期终态。
 		v, e := s.passes.ByID(id, tx)
 		if e != nil {
-			return fmt.Errorf("VisitorPass[id=%d] checkin failed: %w", id, ErrPassNotFound)
+			return fmt.Errorf("VisitorPass[id=%d] checkin reload failed: %w", id, ErrPassNotFound)
 		}
 		now := time.Now()
-		switch {
-		case v.Status == constants.PassStatusCheckedIn:
-			return fmt.Errorf("VisitorPass[id=%s] checkin rejected: already in: %w", v.PassNo, ErrGateAlreadyIn)
-		case v.Status == constants.PassStatusPending:
+		switch v.Status {
+		case constants.PassStatusCheckedIn:
+			return fmt.Errorf("VisitorPass[%s] checkin rejected: already in: %w", v.PassNo, ErrGateAlreadyIn)
+		case constants.PassStatusPending:
 			return fmt.Errorf("VisitorPass[%s] checkin rejected: pending review: %w", v.PassNo, ErrPassState)
-		case v.Status == constants.PassStatusCancelled:
+		case constants.PassStatusCancelled:
 			return fmt.Errorf("VisitorPass[%s] checkin rejected: cancelled: %w", v.PassNo, ErrPassState)
-		case v.Status == constants.PassStatusCompleted:
+		case constants.PassStatusCompleted:
 			return fmt.Errorf("VisitorPass[%s] checkin rejected: completed: %w", v.PassNo, ErrPassState)
-		case v.Status == constants.PassStatusRejected:
+		case constants.PassStatusRejected:
 			return fmt.Errorf("VisitorPass[%s] checkin rejected: rejected: %w", v.PassNo, ErrPassState)
-		case v.Status == constants.PassStatusExpired:
+		case constants.PassStatusExpired:
 			return fmt.Errorf("VisitorPass[%s] checkin rejected: expired: %w", v.PassNo, ErrPassState)
-		case v.Status != constants.PassStatusApproved:
+		case constants.PassStatusApproved:
+			// 继续时段与容量校验
+		default:
 			return fmt.Errorf("VisitorPass[%s] checkin rejected: status=%s: %w", v.PassNo, v.Status, ErrPassState)
 		}
 		if now.Before(v.StartTime) {
@@ -278,11 +341,6 @@ func (s *VisitorService) CheckIn(id, guardID uint, checkpoint string) (model.Vis
 		if now.After(v.EndTime) {
 			return fmt.Errorf("VisitorPass[%s] checkin rejected: past window %s: %w", v.PassNo, util.Date(v.EndTime), ErrPassState)
 		}
-		// 进入瞬间再次确认在场容量，避免审核后并发超限。
-		capCfg, e := s.caps.GetOrCreate(v.Building, tx)
-		if e != nil {
-			return fmt.Errorf("VisitorPass[%s] capacity query failed: %w", v.PassNo, e)
-		}
 		onsite, e := s.passes.CountInBuilding(v.Building, now, tx)
 		if e != nil {
 			return fmt.Errorf("VisitorPass[%s] onsite count failed: %w", v.PassNo, e)
@@ -290,11 +348,16 @@ func (s *VisitorService) CheckIn(id, guardID uint, checkpoint string) (model.Vis
 		if capCfg.DailyLimit > 0 && int(onsite) >= capCfg.DailyLimit {
 			return fmt.Errorf("VisitorPass[%s building=%s] checkin suspended: onsite=%d limit=%d: %w", v.PassNo, v.Building, onsite, capCfg.DailyLimit, ErrCapacityReached)
 		}
-		v.Status = constants.PassStatusCheckedIn
-		v.CheckInAt = &now
-		v.Checkpoint = checkpoint
-		if e = s.passes.Update(&v, tx); e != nil {
+		changed, e := s.passes.Transition(id, []string{constants.PassStatusApproved}, map[string]any{
+			"status":      constants.PassStatusCheckedIn,
+			"check_in_at": now,
+			"checkpoint":  checkpoint,
+		}, tx)
+		if e != nil {
 			return fmt.Errorf("VisitorPass[%s] checkin failed: %w", v.PassNo, e)
+		}
+		if !changed {
+			return fmt.Errorf("VisitorPass[%s] checkin lost race: %w", v.PassNo, ErrStateLost)
 		}
 		if e = s.recordEvent(tx, id, guardID, constants.PassActionCheckIn, constants.PassStatusApproved, constants.PassStatusCheckedIn,
 			fmt.Sprintf("门岗 %s 放行进入，楼栋 %s 在场 %d/%d", checkpoint, v.Building, onsite+1, capCfg.DailyLimit)); e != nil {
@@ -308,24 +371,36 @@ func (s *VisitorService) CheckIn(id, guardID uint, checkpoint string) (model.Vis
 	return s.passes.ByID(id, nil)
 }
 
-// CheckOut 门岗办理离开；离开后实时容量恢复（在场数统计即减一）。
+// CheckOut 门岗办理离开；离开后实时容量恢复。
+// 同一凭证并发办理离开时只有一次 CAS 成功，重复请求读到终态后明确失败、不生成重复离开记录。
 func (s *VisitorService) CheckOut(id, guardID uint, checkpoint string) (model.VisitorPass, error) {
-	e := s.withTx(func(tx *gorm.DB) error {
+	pre, e := s.passes.ByID(id, nil)
+	if e != nil {
+		return model.VisitorPass{}, fmt.Errorf("VisitorPass[id=%d] checkout failed: %w", id, ErrPassNotFound)
+	}
+	e = s.withTx(func(tx *gorm.DB) error {
+		// 首条语句即楼栋写锁，与同楼栋进入/逾期扫描串行。
+		if _, e := s.caps.EnsureLock(tx, pre.Building, constants.DefaultBuildingDailyLimit); e != nil {
+			return fmt.Errorf("VisitorPass[%s] capacity lock failed: %w", pre.PassNo, e)
+		}
 		v, e := s.passes.ByID(id, tx)
 		if e != nil {
-			return fmt.Errorf("VisitorPass[id=%d] checkout failed: %w", id, ErrPassNotFound)
+			return fmt.Errorf("VisitorPass[id=%d] checkout reload failed: %w", id, ErrPassNotFound)
 		}
 		if v.Status != constants.PassStatusCheckedIn {
 			return fmt.Errorf("VisitorPass[%s] checkout rejected: status=%s: %w", v.PassNo, v.Status, ErrGateNotIn)
 		}
 		now := time.Now()
-		v.Status = constants.PassStatusCompleted
-		v.CheckOutAt = &now
+		fields := map[string]any{"status": constants.PassStatusCompleted, "check_out_at": now}
 		if checkpoint != "" {
-			v.Checkpoint = checkpoint
+			fields["checkpoint"] = checkpoint
 		}
-		if e = s.passes.Update(&v, tx); e != nil {
+		changed, e := s.passes.Transition(id, []string{constants.PassStatusCheckedIn}, fields, tx)
+		if e != nil {
 			return fmt.Errorf("VisitorPass[%s] checkout failed: %w", v.PassNo, e)
+		}
+		if !changed {
+			return fmt.Errorf("VisitorPass[%s] checkout lost race: %w", v.PassNo, ErrStateLost)
 		}
 		if e = s.recordEvent(tx, id, guardID, constants.PassActionCheckOut, constants.PassStatusCheckedIn, constants.PassStatusCompleted,
 			fmt.Sprintf("门岗 %s 办理离开 %s，楼栋 %s 容量已恢复", checkpoint, v.PassNo, v.Building)); e != nil {
@@ -386,6 +461,8 @@ func (s *VisitorService) GateVerify(passNo string, guardID uint) (model.VisitorP
 }
 
 // SweepExpired 定时兜底：已过结束时段仍未离场的在场/已通过凭证标记逾期并恢复容量。
+// 与门岗进入/离开互斥（楼栋锁），并用 CAS 保证只对 approved/checked_in 终态迁移一次，
+// 若期间已被办理离开则不改写终态、不写逾期留痕。
 func (s *VisitorService) SweepExpired() (int, error) {
 	due, e := s.passes.ExpiredDue(time.Now())
 	if e != nil {
@@ -394,28 +471,40 @@ func (s *VisitorService) SweepExpired() (int, error) {
 	marked := 0
 	for _, p := range due {
 		id := p.ID
+		building := p.Building
+		passNo := p.PassNo
+		endAt := p.EndTime
 		if e = s.withTx(func(tx *gorm.DB) error {
+			// 首条语句即楼栋写锁，与门岗进入/离开互斥。
+			if _, e := s.caps.EnsureLock(tx, building, constants.DefaultBuildingDailyLimit); e != nil {
+				return e
+			}
 			v, e := s.passes.ByID(id, tx)
 			if e != nil {
 				return e
 			}
 			now := time.Now()
 			from := v.Status
-			v.Status = constants.PassStatusExpired
-			v.ExpireMarkedAt = &now
-			if e = s.passes.Update(&v, tx); e != nil {
+			changed, e := s.passes.Transition(id,
+				[]string{constants.PassStatusApproved, constants.PassStatusCheckedIn},
+				map[string]any{"status": constants.PassStatusExpired, "expire_marked_at": now}, tx)
+			if e != nil {
 				return e
+			}
+			if !changed {
+				// 已被并发离开/取消，放弃本条，不写留痕。
+				return nil
 			}
 			if e = s.recordEvent(tx, id, 0, constants.PassActionExpire, from, constants.PassStatusExpired,
-				fmt.Sprintf("凭证 %s 超过离场时间 %s 未离场，系统标记逾期，容量恢复", v.PassNo, util.Date(v.EndTime))); e != nil {
+				fmt.Sprintf("凭证 %s 超过离场时间 %s 未离场，系统标记逾期，容量恢复", passNo, util.Date(endAt))); e != nil {
 				return e
 			}
+			marked++
 			return nil
 		}); e != nil {
 			s.logger.Error("sweep visitor pass", "pass_id", id, "error", e)
 			continue
 		}
-		marked++
 	}
 	return marked, nil
 }
@@ -428,7 +517,6 @@ func (s *VisitorService) CapacityOverview() ([]map[string]any, error) {
 	}
 	now := time.Now()
 	out := make([]map[string]any, 0, len(cfgs))
-	seen := map[string]bool{}
 	for _, c := range cfgs {
 		onsite, e := s.passes.CountInBuilding(c.Building, now, nil)
 		if e != nil {
@@ -439,7 +527,6 @@ func (s *VisitorService) CapacityOverview() ([]map[string]any, error) {
 			remaining = -1 // 0 表示不限
 		}
 		out = append(out, map[string]any{"building": c.Building, "daily_limit": c.DailyLimit, "onsite": onsite, "remaining": remaining})
-		seen[c.Building] = true
 	}
 	return out, nil
 }

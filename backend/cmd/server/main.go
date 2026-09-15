@@ -14,6 +14,7 @@ import (
 	"gorm.io/gorm"
 	"log"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -52,7 +53,16 @@ func openDB(c config.Config) (*gorm.DB, error) {
 	if c.DBDriver == "mysql" {
 		return gorm.Open(mysql.Open(c.DSN), &gorm.Config{})
 	}
-	return gorm.Open(sqlite.Open(c.DSN), &gorm.Config{})
+	// SQLite 文件库：开启 WAL 并设置忙等待，使并发事务在楼栋写锁上排队而非立即 database is locked。
+	dsn := c.DSN
+	if !strings.Contains(dsn, ":memory:") {
+		sep := "?"
+		if strings.Contains(dsn, "?") {
+			sep = "&"
+		}
+		dsn += sep + "_busy_timeout=5000&_journal_mode=WAL&_foreign_keys=on"
+	}
+	return gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 }
 func seed(db *gorm.DB) error {
 	var n int64

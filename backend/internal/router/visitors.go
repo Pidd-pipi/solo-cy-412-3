@@ -16,11 +16,12 @@ func RegisterVisitors(g *gin.RouterGroup, sv Services, h *handler.Handler) {
 	gate := handler.NewGateHandler(sv.Visitors, h)
 	capH := handler.NewBuildingCapacityHandler(sv.Visitors, h)
 
-	// 业主端：凭证登记与自助取消。
+	// 业主端：凭证登记与自助取消（仅限业主角色，归属校验在 service 内再兜底）。
+	residentOnly := middleware.RequireRole(constants.UserRoleResident)
 	g.GET("/visitor/passes", middleware.OperationLog(sv.Logs, "visitor.list"), v.List)
-	g.POST("/visitor/passes", v.Create)
+	g.POST("/visitor/passes", residentOnly, v.Create)
 	g.GET("/visitor/passes/:id", v.Detail)
-	g.POST("/visitor/passes/:id/cancel", v.Cancel)
+	g.POST("/visitor/passes/:id/cancel", residentOnly, v.Cancel)
 
 	// 物业工作台：审核（通过/驳回）与楼栋容量配置。
 	g.POST("/visitor/passes/:id/approve", middleware.RequirePermission(sv.Permissions, constants.PermissionVisitorReview), v.Approve)

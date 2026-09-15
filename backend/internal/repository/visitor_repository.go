@@ -27,6 +27,19 @@ func (r *VisitorPassRepository) Update(v *model.VisitorPass, tx *gorm.DB) error 
 	return r.tx(tx).Save(v).Error
 }
 
+// Transition 仅当凭证当前状态属于 expect 集合时，才原子地更新为新状态并写入给定字段。
+// 返回 changed 表示本次调用是否赢得状态竞争；并发的重复调用中只有一次 changed=true。
+// 以数据库行级条件更新（CAS）替代"读后写整行"，保证终态不被重复请求改写、且无重复留痕。
+func (r *VisitorPassRepository) Transition(id uint, expect []string, fields map[string]any, tx *gorm.DB) (bool, error) {
+	res := r.tx(tx).Model(&model.VisitorPass{}).
+		Where("id = ? AND status IN ?", id, expect).
+		Updates(fields)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
 func (r *VisitorPassRepository) preload(q *gorm.DB) *gorm.DB {
 	return q.Preload("Resident").Preload("Reviewer")
 }
@@ -77,11 +90,22 @@ func (r *VisitorPassRepository) FindOverlap(phone, building string, start, end t
 	return n, e
 }
 
-// CountInBuilding 某楼栋当前在场访客数（实时容量占用）。
+// CountInBuilding 某楼栋当前在场访客数（status=checked_in），实时容量占用。
 func (r *VisitorPassRepository) CountInBuilding(building string, at time.Time, tx *gorm.DB) (int64, error) {
 	var n int64
 	e := r.tx(tx).Model(&model.VisitorPass{}).
 		Where("building = ? AND status = ?", building, constants.PassStatusCheckedIn).
+		Count(&n).Error
+	return n, e
+}
+
+// CountOccupied 某楼栋已承诺名额：已审核通过（待进入）+ 在场。
+// 审核通过即预留一个名额，取消/驳回/逾期/完成时释放，保证并发审核不会越过当日上限。
+func (r *VisitorPassRepository) CountOccupied(building string, tx *gorm.DB) (int64, error) {
+	var n int64
+	e := r.tx(tx).Model(&model.VisitorPass{}).
+		Where("building = ? AND status IN ?", building,
+			[]string{constants.PassStatusApproved, constants.PassStatusCheckedIn}).
 		Count(&n).Error
 	return n, e
 }

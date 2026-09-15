@@ -16,7 +16,7 @@ func failVisitor(c *gin.Context, e error) {
 		Fail(c, http.StatusNotFound, constants.CodeNotFound, e.Error())
 	case errors.Is(e, service.ErrPassForbidden):
 		Fail(c, http.StatusForbidden, constants.CodeForbidden, e.Error())
-	case errors.Is(e, service.ErrPassOverlap), errors.Is(e, service.ErrCapacityReached):
+	case errors.Is(e, service.ErrPassOverlap), errors.Is(e, service.ErrCapacityReached), errors.Is(e, service.ErrStateLost):
 		Fail(c, http.StatusConflict, constants.CodeConflict, e.Error())
 	case errors.Is(e, service.ErrPassState), errors.Is(e, service.ErrPassTimeInvalid),
 		errors.Is(e, service.ErrGateNotInWindow), errors.Is(e, service.ErrGateAlreadyIn),

@@ -46,7 +46,7 @@ func (h *VisitorHandler) Create(c *gin.Context) {
 		Fail(c, 400, 40001, "到访结束时间格式不合法")
 		return
 	}
-	v, err := h.svc.Create(c.GetUint("userID"), r.VisitorName, r.VisitorPhone, r.Building, r.Reason, start, end)
+	v, err := h.svc.Create(c.GetUint("userID"), c.GetString("role"), r.VisitorName, r.VisitorPhone, r.Building, r.Reason, start, end)
 	if err != nil {
 		failVisitor(c, err)
 		return

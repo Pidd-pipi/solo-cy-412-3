@@ -2,9 +2,10 @@ package repository
 
 import (
 	"errors"
-	"github.com/smartestate/smartestate/internal/constants"
+
 	"github.com/smartestate/smartestate/internal/model"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type BuildingCapacityRepository struct{ DB *gorm.DB }
@@ -13,19 +14,26 @@ func NewBuildingCapacityRepository(db *gorm.DB) *BuildingCapacityRepository {
 	return &BuildingCapacityRepository{db}
 }
 
-// GetOrCreate 返回楼栋容量配置；未配置时回退缺省上限（不落库，避免登记新楼栋时产生隐式写入）。
-// 传入 tx 时在同一事务/连接内查询，避免与外层事务争用连接。
-func (r *BuildingCapacityRepository) GetOrCreate(building string, tx *gorm.DB) (model.BuildingCapacity, error) {
-	var v model.BuildingCapacity
-	q := r.DB
-	if tx != nil {
-		q = tx
+// EnsureLock 在调用方事务内确保该楼栋存在容量行，并对该行加写锁（MySQL 为 SELECT … FOR UPDATE）。
+// 同一楼栋的登记/审核/进入/离开都先获取此锁，从而在数据库层串行化，杜绝"读后判"并发竞态。
+// SQLite 不支持行锁，FOR UPDATE 被方言忽略，其单写者语义配合 busy_timeout 同样保证串行。
+func (r *BuildingCapacityRepository) EnsureLock(tx *gorm.DB, building string, defaultLimit int) (model.BuildingCapacity, error) {
+	seed := model.BuildingCapacity{Building: building, DailyLimit: defaultLimit}
+	if e := tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "building"}},
+		DoNothing: true,
+	}).Create(&seed).Error; e != nil {
+		return seed, e
 	}
-	e := q.Where("building = ?", building).First(&v).Error
-	if errors.Is(e, gorm.ErrRecordNotFound) {
-		return model.BuildingCapacity{Building: building, DailyLimit: constants.DefaultBuildingDailyLimit}, nil
+	q := tx.Where("building = ?", building)
+	if r.DB.Dialector.Name() == "mysql" {
+		q = q.Clauses(clause.Locking{Strength: "UPDATE"})
 	}
-	return v, e
+	var cfg model.BuildingCapacity
+	if e := q.First(&cfg).Error; e != nil {
+		return cfg, e
+	}
+	return cfg, nil
 }
 
 // Upsert 物业调整楼栋当日容量上限。

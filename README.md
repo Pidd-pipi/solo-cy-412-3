@@ -156,7 +156,9 @@ OpenAPI 摘要位于 `backend/api/openapi.yaml`。
 ### 容量规则（BuildingCapacity）
 
 - 在场人数不做累加计数，而由 `visitor_passes.status='checked_in'` 实时统计：进入即减剩余、离开或逾期标记后自动恢复，杜绝计数器与实际状态不一致。
-- 审核通过与办理进入两个节点都在事务内复核 `在场数 < 当日上限`，达到上限返回业务冲突码 `40901` 并暂停新凭证审核。
+- 审核通过与办理进入两个节点都在事务内复核名额，达到上限返回业务冲突码 `40901` 并暂停新凭证审核。
+- **并发安全**：所有状态变更在数据库事务内执行。先对 `building_capacities` 楼栋行加写锁（MySQL `SELECT … FOR UPDATE`，SQLite 用 WAL + busy_timeout 排队）将同楼栋操作串行化；再以条件更新 `UPDATE … WHERE id=? AND status IN (?)`（CAS，按 RowsAffected 判定）迁移状态。因此两名物业并发审核同一凭证或同一楼栋一批凭证时只有一个成功、已承诺名额（已通过+在场）绝不越上限；同一凭证并发办理进入/离开只成功一次，终态不被改写，失败请求明确返回 409 且不产生任何留痕。SQLite 文件库默认开启 `_journal_mode=WAL&_busy_timeout=5000`。
+- **授权**：登记仅业主可发起（路由 `RequireRole(resident)` + service 双重校验）；取消仅凭证登记业主本人，物业/门岗/管理员不能代他人创建或取消；审核需 `visitor:review`，门岗进出需 `visitor:gate`。
 
 ## 环境变量
 

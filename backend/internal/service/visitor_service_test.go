@@ -45,7 +45,7 @@ func TestVisitorPassLifecycleAndCapacity(t *testing.T) {
 	start := time.Now().Add(-time.Hour)
 	end := time.Now().Add(2 * time.Hour)
 
-	pass, err := svc.Create(resident.ID, "张三", "13900000001", building, "探亲", start, end)
+	pass, err := svc.Create(resident.ID, "resident", "张三", "13900000001", building, "探亲", start, end)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestVisitorPassLifecycleAndCapacity(t *testing.T) {
 	}
 
 	// 重叠时段登记同一访客同一楼栋应被拒绝。
-	if _, err = svc.Create(resident.ID, "张三", "13900000001", building, "探亲", start.Add(30*time.Minute), end.Add(time.Hour)); err == nil {
+	if _, err = svc.Create(resident.ID, "resident", "张三", "13900000001", building, "探亲", start.Add(30*time.Minute), end.Add(time.Hour)); err == nil {
 		t.Fatal("expected overlap conflict")
 	}
 
@@ -81,7 +81,7 @@ func TestVisitorPassLifecycleAndCapacity(t *testing.T) {
 	// 第二张凭证：不同访客，审核时因容量已满被暂停。
 	start2 := time.Now().Add(-30 * time.Minute)
 	end2 := time.Now().Add(3 * time.Hour)
-	pass2, err := svc.Create(resident.ID, "李四", "13900000002", building, "访友", start2, end2)
+	pass2, err := svc.Create(resident.ID, "resident", "李四", "13900000002", building, "访友", start2, end2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestVisitorGateWindowAndCancel(t *testing.T) {
 	svc, _, resident, staff := newVisitorFixture(t)
 	// 未到时段。
 	future := time.Now().Add(2 * time.Hour)
-	pass, err := svc.Create(resident.ID, "王五", "13900000003", "2栋", "送货", future, future.Add(2*time.Hour))
+	pass, err := svc.Create(resident.ID, "resident", "王五", "13900000003", "2栋", "送货", future, future.Add(2*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestVisitorExpirySweepRestoresCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 已过期的在场凭证。
-	pass, err := svc.Create(resident.ID, "赵六", "13900000004", building, "维修", time.Now().Add(-3*time.Hour), time.Now().Add(-time.Hour))
+	pass, err := svc.Create(resident.ID, "resident", "赵六", "13900000004", building, "维修", time.Now().Add(-3*time.Hour), time.Now().Add(-time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
